@@ -38,8 +38,9 @@ from quemb.shared.external.unrestricted_utils import make_uhf_obj
 from quemb.shared.helper import delete_multiple_files, unused
 from quemb.shared.manage_scratch import WorkDir
 from quemb.shared.typing import Matrix, Vector
+from quemb.molbe.vqe_solver import VQE_ArgsUser, solve_vqe
 
-Solvers: TypeAlias = Literal["MP2", "CCSD", "FCI", "HCI", "SHCI", "SCI", "DMRG"]
+Solvers: TypeAlias = Literal["MP2", "CCSD", "FCI", "HCI", "SHCI", "SCI", "DMRG", "VQE"]
 USolvers: TypeAlias = Literal["UCCSD"]
 
 
@@ -486,6 +487,16 @@ def be_func(
                         frag_scratch.path.glob("FCIDUMP*"),
                         frag_scratch.path.glob("node*"),
                     )
+
+        elif solver == "VQE":
+            assert isinstance(solver_args, VQE_ArgsUser)
+            # VQE returns both rdm1 and rdm2
+            rdm1_tmp, rdm2s = solve_vqe(
+                fobj._mf,
+                fobj,
+                vqe_args=solver_args,
+                be_energy=total_e[0] if eeval else None,
+            )
 
         else:
             raise ValueError("Solver not implemented")

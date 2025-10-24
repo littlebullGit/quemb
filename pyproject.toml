@@ -28,6 +28,9 @@ dependencies = [
     "libdmet @ git+https://github.com/gkclab/libdmet_preview.git",
     "chemcoord @ git+https://github.com/mcocdawc/chemcoord.git",
     "pathos",
+    "qiskit>=1.0.0",
+    "qiskit-nature>=0.7.0",
+    "qiskit-algorithms>=0.3.0",
 ]
 
 [project.license]
