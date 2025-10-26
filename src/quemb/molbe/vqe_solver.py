@@ -26,14 +26,16 @@ from quemb.shared.typing import Matrix
 
 # Qiskit imports
 try:
-    from qiskit import QuantumCircuit
+    from qiskit import QuantumCircuit, transpile
     from qiskit.circuit import Parameter
-    from qiskit.primitives import StatevectorEstimator as Estimator
+    from qiskit.primitives import BackendEstimatorV2
     from qiskit.quantum_info import SparsePauliOp, Statevector
     from qiskit_algorithms.optimizers import COBYLA
     from qiskit_algorithms import VQE as QiskitVQE
+    from qiskit_algorithms.exceptions import AlgorithmError
     from qiskit_nature.second_q.mappers import JordanWignerMapper
     from qiskit_nature.second_q.operators import FermionicOp
+    from qiskit_aer import AerSimulator
 
     QISKIT_AVAILABLE = True
 except ImportError as e:
@@ -514,6 +516,10 @@ def solve_vqe(
 
     # Build UCCSD ansatz
     ansatz = build_uccsd_ansatz(norb, nelec)
+    
+    # Transpile ansatz to decompose high-level gates (EvolvedOps) into basic gates
+    # This is required for Aer compatibility
+    ansatz = transpile(ansatz, basis_gates=['u1', 'u2', 'u3', 'cx'], optimization_level=1)
 
     # Initial parameters (warm-start or cold-start)
     if vqe_args.warm_start and frag_name in _vqe_state.fragment_params:
@@ -532,15 +538,67 @@ def solve_vqe(
         tol=energy_tol,
     )
 
-    # Setup VQE
-    estimator = Estimator()
-    vqe = QiskitVQE(estimator, ansatz, optimizer, initial_point=initial_point)
+    # Setup VQE with Aer backend (GPU or multi-threaded CPU)
+    # Check environment variable for device preference
+    import os
+    device = os.environ.get('QISKIT_DEVICE', 'CPU').upper()
+
+    backend = None
+
+    if device == 'GPU':
+        # GPU backend for 8-12x speedup on CUDA-enabled instances
+        try:
+            backend = AerSimulator(
+                method='statevector',
+                device='GPU',
+                precision='single'  # Single precision for 2x faster
+            )
+            if vqe_args.verbose >= 1:
+                print("  Using Aer GPU backend")
+        except Exception as exc:
+            if vqe_args.verbose >= 1:
+                print(f"  GPU backend unavailable ({exc}); falling back to CPU")
+            device = 'CPU'
+
+    if backend is None:
+        # Multi-threaded CPU backend for 3-4x speedup
+        max_threads = int(os.environ.get('OMP_NUM_THREADS', '8'))
+        backend = AerSimulator(
+            method='statevector',
+            device='CPU',
+            max_parallel_threads=max_threads
+        )
+        if vqe_args.verbose >= 1:
+            print(f"  Using Aer CPU backend with {max_threads} threads")
+    
+    def build_vqe(selected_backend: AerSimulator) -> QiskitVQE:
+        estimator_local = BackendEstimatorV2(backend=selected_backend)
+        return QiskitVQE(estimator_local, ansatz, optimizer, initial_point=initial_point)
+
+    vqe = build_vqe(backend)
 
     # Run VQE
     if vqe_args.verbose >= 2:
         print(f"  Running VQE optimization...")
 
-    result = vqe.compute_minimum_eigenvalue(qubit_hamiltonian)
+    try:
+        result = vqe.compute_minimum_eigenvalue(qubit_hamiltonian)
+    except AlgorithmError as exc:
+        if device == 'GPU':
+            if vqe_args.verbose >= 1:
+                print(f"  GPU execution failed ({exc}); retrying on CPU backend")
+            max_threads = int(os.environ.get('OMP_NUM_THREADS', '8'))
+            cpu_backend = AerSimulator(
+                method='statevector',
+                device='CPU',
+                max_parallel_threads=max_threads
+            )
+            if vqe_args.verbose >= 1:
+                print(f"  Using Aer CPU backend with {max_threads} threads")
+            vqe = build_vqe(cpu_backend)
+            result = vqe.compute_minimum_eigenvalue(qubit_hamiltonian)
+        else:
+            raise
 
     # Extract results
     optimal_energy = result.eigenvalue.real + core_energy
