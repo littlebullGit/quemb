@@ -17,6 +17,7 @@ from numpy import (
     floating,
     mean,
     ndarray,
+    trace,
     zeros_like,
 )
 from numpy.linalg import multi_dot
@@ -339,8 +340,15 @@ def be_func(
 
         elif solver == "FCI":
             mc = fci.FCI(fobj._mf, fobj._mf.mo_coeff)
-            _, civec = mc.kernel()
+            fci_energy, civec = mc.kernel()
             rdm1_tmp = mc.make_rdm1(civec, mc.norb, mc.nelec)
+            
+            # DEBUG: Print FCI fragment energy for comparison with VQE
+            print(f"\n=== DEBUG FCI FRAGMENT ENERGY ===")
+            print(f"Fragment {fobj.dname}: FCI energy = {fci_energy:.10f} Ha")
+            print(f"Fragment {fobj.dname}: HF energy = {fobj._mf.e_tot:.10f} Ha")
+            print(f"Fragment {fobj.dname}: Correlation = {fci_energy - fobj._mf.e_tot:.10f} Ha")
+            print(f"==================================\n")
 
         elif solver == "HCI":  # TODO
             # pylint: disable-next=E0611
@@ -501,19 +509,39 @@ def be_func(
         else:
             raise ValueError("Solver not implemented")
 
-        fobj.rdm1__ = rdm1_tmp.copy()
+        # Store MO-basis RDM for energy calculations
+        if solver == "VQE":
+            # VQE already produces correctly normalized RDMs (trace = total electrons)
+            # No scaling needed - VQE implementation is already correct
+            vqe_trace = trace(rdm1_tmp)
+            fobj.rdm1__ = rdm1_tmp.copy()
+            print(f"DEBUG: VQE RDM trace: {vqe_trace:.6f} (expected: {2 * fobj.nsocc}, no scaling applied)")
+        else:
+            # FCI and other solvers already have correct normalization
+            fobj.rdm1__ = rdm1_tmp.copy()
 
+        # Transform RDM to AO basis for density matching
+        # NOTE: VQE is special - it computes RDMs in the FCIDUMP basis
+        # When FCIDUMP uses basis='embedding', RDMs are already in embedding AO basis
+        # and should NOT be transformed. Only traditional solvers (FCI, CCSD, etc.)
+        # compute RDMs in MO basis that need C*rdm*C^T transformation.
         assert fobj.mo_coeffs is not None
-        fobj._rdm1 = (
-            multi_dot(
-                (
-                    fobj.mo_coeffs,
-                    rdm1_tmp,
-                    fobj.mo_coeffs.T,
-                ),
+        if solver == "VQE":
+            # VQE RDMs are computed in embedding AO basis (from FCIDUMP)
+            # Use the same RDM as MO-basis (no transformation needed)
+            fobj._rdm1 = rdm1_tmp.copy()
+        else:
+            # Traditional solvers: RDMs in MO basis, transform to AO basis
+            fobj._rdm1 = (
+                multi_dot(
+                    (
+                        fobj.mo_coeffs,
+                        rdm1_tmp,
+                        fobj.mo_coeffs.T,
+                    ),
+                )
+                * 0.5
             )
-            * 0.5
-        )
 
         if eeval:
             if solver == "FCI" or solver == "SCI":
@@ -539,21 +567,75 @@ def be_func(
             fobj.rdm2__ = rdm2s.copy()
             # Find the energy of a given fragment.
             # Return [e1, e2, ec] as e_f and add to the running total_e.
-            e_f = get_frag_energy(
-                mo_coeffs=fobj.mo_coeffs,
-                nsocc=fobj.nsocc,
-                n_frag=fobj.n_frag,
-                weight_and_relAO_per_center=fobj.weight_and_relAO_per_center,
-                TA=fobj.TA,
-                h1=fobj.h1,
-                rdm1=rdm1_tmp,
-                rdm2s=rdm2s,
-                dname=fobj.dname,
-                veff0=fobj.veff0,
-                veff=None if use_cumulant else fobj.veff,
-                use_cumulant=use_cumulant,
-                eri_file=fobj.eri_file,
-            )
+            # DEBUG: Check Hamiltonian being used for energy assembly
+            if solver == "VQE":
+                print(f"\n=== DEBUG ENERGY ASSEMBLY FOR VQE ===")
+                print(f"Fragment {fobj.dname}:")
+                print(f"fobj.h1 (original core) diagonal: {diag(fobj.h1)}")
+                print(f"fobj.fock diagonal: {diag(fobj.fock)}")
+                print(f"fobj.heff diagonal: {diag(fobj.heff)}")
+                print(f"fobj._effective_h1e diagonal: {diag(fobj._effective_h1e)}")
+                print(f"Difference (fock - h1): {diag(fobj.fock - fobj.h1)}")
+                print(f"==========================================\n")
+                
+                # THEORY TEST: Try both original h1 and effective h1e
+                print(f"TESTING THEORY: Computing energy with original h1...")
+                e_f_original = get_frag_energy(
+                    mo_coeffs=fobj.mo_coeffs,
+                    nsocc=fobj.nsocc,
+                    n_frag=fobj.n_frag,
+                    weight_and_relAO_per_center=fobj.weight_and_relAO_per_center,
+                    TA=fobj.TA,
+                    h1=fobj.h1,  # Original core Hamiltonian
+                    rdm1=rdm1_tmp,
+                    rdm2s=rdm2s,
+                    dname=fobj.dname,
+                    veff0=fobj.veff0,
+                    veff=None if use_cumulant else fobj.veff,
+                    use_cumulant=use_cumulant,
+                    eri_file=fobj.eri_file,
+                )
+                
+                print(f"TESTING THEORY: Computing energy with effective h1e...")
+                e_f_effective = get_frag_energy(
+                    mo_coeffs=fobj.mo_coeffs,
+                    nsocc=fobj.nsocc,
+                    n_frag=fobj.n_frag,
+                    weight_and_relAO_per_center=fobj.weight_and_relAO_per_center,
+                    TA=fobj.TA,
+                    h1=fobj._effective_h1e,  # Effective Hamiltonian (includes heff)
+                    rdm1=rdm1_tmp,
+                    rdm2s=rdm2s,
+                    dname=fobj.dname,
+                    veff0=fobj.veff0,
+                    veff=None if use_cumulant else fobj.veff,
+                    use_cumulant=use_cumulant,
+                    eri_file=fobj.eri_file,
+                )
+                
+                print(f"Energy with original h1: {e_f_original}")
+                print(f"Energy with effective h1e: {e_f_effective}")
+                print(f"Difference: {[a - b for a, b in zip(e_f_effective, e_f_original)]}")
+                
+                # Use original h1 for VQE (REVERT: effective h1e made things worse)
+                e_f = e_f_original
+                print(f"USING ORIGINAL H1 FOR VQE ENERGY ASSEMBLY (effective h1e made total energy worse)")
+            else:
+                e_f = get_frag_energy(
+                    mo_coeffs=fobj.mo_coeffs,
+                    nsocc=fobj.nsocc,
+                    n_frag=fobj.n_frag,
+                    weight_and_relAO_per_center=fobj.weight_and_relAO_per_center,
+                    TA=fobj.TA,
+                    h1=fobj.h1,
+                    rdm1=rdm1_tmp,
+                    rdm2s=rdm2s,
+                    dname=fobj.dname,
+                    veff0=fobj.veff0,
+                    veff=None if use_cumulant else fobj.veff,
+                    use_cumulant=use_cumulant,
+                    eri_file=fobj.eri_file,
+                )
             total_e = [sum(x) for x in zip(total_e, e_f)]
             fobj.update_ebe_hf()
     if eeval:
@@ -687,7 +769,7 @@ def be_func_u(
     return (E, total_e)
 
 
-def solve_error(Fobjs, Nocc, only_chem=False):
+def solve_error(Fobjs, Nocc, only_chem=False, return_components: bool = False):
     """
     Compute the error for self-consistent fragment density matrix matching.
 
@@ -708,10 +790,13 @@ def solve_error(Fobjs, Nocc, only_chem=False):
         Norm of the error vector.
     numpy.ndarray
         Error vector.
+    list[dict], optional
+        When ``return_components`` is True, metadata for each error element.
     """
 
     err_edge = []
     err_chempot = 0.0
+    components: list[dict[str, float | int | str | tuple[int, int] | None]] = []
 
     if only_chem:
         for fobj in Fobjs:
@@ -721,26 +806,57 @@ def solve_error(Fobjs, Nocc, only_chem=False):
         err_chempot /= Fobjs[0].unitcell_nkpt
         err = err_chempot - Nocc
 
+        if return_components:
+            payload = {
+                "type": "chemical_potential",
+                "fragment": "global",
+                "edge_value": err_chempot,
+                "center_value": Nocc,
+                "difference": err,
+            }
+            return abs(err), asarray([err]), [payload]
+
         return abs(err), asarray([err])
 
     # Compute edge and chemical potential errors
-    for fobj in Fobjs:
+    for findx, fobj in enumerate(Fobjs):
         # match rdm-edge
-        for edge in fobj.relAO_per_edge:
+        for edge_idx, edge in enumerate(fobj.relAO_per_edge):
             for j_ in range(len(edge)):
                 for k_ in range(len(edge)):
                     if j_ > k_:
                         continue
-                    err_edge.append(fobj._rdm1[edge[j_], edge[k_]])
+                    value_edge = fobj._rdm1[edge[j_], edge[k_]]
+                    err_edge.append(value_edge)
+                    if return_components:
+                        components.append(
+                            {
+                                "type": "edge",
+                                "fragment": getattr(fobj, "dname", str(findx)),
+                                "fragment_index": findx,
+                                "edge_index": edge_idx,
+                                "pair": (edge[j_], edge[k_]),
+                                "edge_value": value_edge,
+                            }
+                        )
         # chem potential
         for i in fobj.weight_and_relAO_per_center[1]:
             err_chempot += fobj._rdm1[i, i]
 
     err_chempot /= Fobjs[0].unitcell_nkpt
     err_edge.append(err_chempot)  # far-end edges are included as err_chempot
+    if return_components:
+        components.append(
+            {
+                "type": "chemical_potential",
+                "fragment": "global",
+                "edge_value": err_chempot,
+            }
+        )
 
     # Compute center errors
     err_cen = []
+    comp_idx = 0
     for findx, fobj in enumerate(Fobjs):
         # Match RDM for centers
         for cindx, cens in enumerate(fobj.relAO_in_ref_per_edge):
@@ -749,13 +865,21 @@ def solve_error(Fobjs, Nocc, only_chem=False):
                 for k_ in range(lenc):
                     if j_ > k_:
                         continue
-                    err_cen.append(
-                        Fobjs[fobj.ref_frag_idx_per_edge[cindx]]._rdm1[
-                            cens[j_], cens[k_]
-                        ]
-                    )
+                    ref_idx = fobj.ref_frag_idx_per_edge[cindx]
+                    center_value = Fobjs[ref_idx]._rdm1[cens[j_], cens[k_]]
+                    err_cen.append(center_value)
+                    if return_components and comp_idx < len(components):
+                        components[comp_idx]["reference_fragment"] = getattr(
+                            Fobjs[ref_idx], "dname", str(ref_idx)
+                        )
+                        components[comp_idx]["reference_fragment_index"] = ref_idx
+                        components[comp_idx]["reference_pair"] = (cens[j_], cens[k_])
+                        components[comp_idx]["center_value"] = center_value
+                    comp_idx += 1
 
     err_cen.append(Nocc)
+    if return_components and components:
+        components[-1]["center_value"] = Nocc
     err_edge = array(err_edge)
     err_cen = array(err_cen)
 
@@ -764,6 +888,11 @@ def solve_error(Fobjs, Nocc, only_chem=False):
 
     # Compute the norm of the error vector
     norm_ = mean(err_vec * err_vec) ** 0.5
+
+    if return_components:
+        for idx, comp in enumerate(components):
+            comp["difference"] = float(err_vec[idx]) if idx < len(err_vec) else None
+        return norm_, err_vec, components
 
     return norm_, err_vec
 

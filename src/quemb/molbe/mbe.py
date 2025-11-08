@@ -754,6 +754,7 @@ class BE:
         max_iter: int = 500,
         trust_region: bool = False,
         solver_args: UserSolverArgs | None = None,
+        log_density_iterations: bool = False,
     ) -> None:
         """BE optimization function
 
@@ -791,6 +792,9 @@ class BE:
             Options include HF, MP2, CCSD
         trust_region :
             Use trust-region based QN optimization, by default False
+        log_density_iterations :
+            When True, print fragment row density matrices and matching components
+            during each BE iteration for debugging, by default False
         """
         # Check if only chemical potential optimization is required
         if not only_chem:
@@ -834,6 +838,7 @@ class BE:
             solver=solver,
             ebe_hf=self.ebe_hf,
             solver_args=solver_args,
+            log_density_iterations=log_density_iterations,
         )
 
         if method == "QN":
@@ -848,6 +853,31 @@ class BE:
             # Perform the optimization
             be_.optimize(method, J0=J0, trust_region=trust_region)
 
+            # Print the energy components
+            if use_cumulant:
+                self.ebe_tot = be_.Ebe[0] + self.ebe_hf
+                print_energy_cumulant(
+                    be_.Ebe[0],
+                    be_.Ebe[1][1],
+                    be_.Ebe[1][0] + be_.Ebe[1][2],
+                    self.ebe_hf,
+                )
+            else:
+                self.ebe_tot = be_.Ebe[0] + self.enuc
+                print_energy_noncumulant(
+                    be_.Ebe[0],
+                    be_.Ebe[1][0],
+                    be_.Ebe[1][2],
+                    be_.Ebe[1][1],
+                    self.ebe_hf,
+                    self.enuc,
+                )
+        elif method == "SCIPY":
+            # Use SciPy optimization instead of Broyden
+            # No initial Jacobian needed for SciPy methods
+            J0 = None
+            # Perform the optimization
+            be_.optimize(method, J0=J0, trust_region=False)  # trust_region not used for SciPy
             # Print the energy components
             if use_cumulant:
                 self.ebe_tot = be_.Ebe[0] + self.ebe_hf

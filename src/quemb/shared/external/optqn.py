@@ -24,12 +24,26 @@ logger = logging.getLogger(__name__)
 
 def line_search_LF(func, xold, fold, dx, iter_):
     """Adapted from D.-H. Li and M. Fukushima, Optimization Metheods and Software,
-    13, 181 (2000)"""
+    13, 181 (2000)
+    
+    Enhanced with chemical potential step limiting for Bootstrap Embedding stability.
+    """
     beta = 0.1
     rho = 0.9
     sigma1 = 1e-3
     sigma2 = 1e-3
     eta = (iter_ + 1) ** -2.0
+
+    # Enhanced stability: limit initial step size for large chemical potential changes
+    max_chem_pot_step = 2.0  # Maximum chemical potential change in Hartree
+    max_step_magnitude = norm(dx)
+    
+    if max_step_magnitude > max_chem_pot_step:
+        print(f"  Line search: Large step detected ({max_step_magnitude:.6f} Ha)", flush=True)
+        print(f"  Line search: Pre-scaling step to {max_chem_pot_step:.6f} Ha for stability", flush=True)
+        initial_scale = max_chem_pot_step / max_step_magnitude
+        dx = dx * initial_scale
+        print(f"  Line search: Applied pre-scaling factor: {initial_scale:.6f}", flush=True)
 
     xk = xold + dx
     lcout = 0
@@ -51,10 +65,16 @@ def line_search_LF(func, xold, fold, dx, iter_):
 
             lcout += 1
             norm_fk = norm(fk)
+            
+            # Additional safety: stop line search if step becomes too small
+            if alp < 1e-8:
+                print(f"  Line search: Step size too small (α = {alp:.2e}), stopping", flush=True)
+                break
             if lcout == 20:
                 break
 
     print(" No. of line search steps in QN opt :", lcout, flush=True)
+    print(f" Final step size (α): {alp:.6f}", flush=True)
     print(flush=True)
     return alp, xk, fk
 
@@ -199,13 +219,76 @@ class FrankQN:
         self.xold = self.xnew.copy()
         self.fold = self.fnew.copy()
 
-        if not iter == 0:
-            tmp__ = outer(dx_i - self.Binv @ df_i, dx_i @ self.Binv) / (
-                dx_i @ self.Binv @ df_i
-            )
-            self.Binv += tmp__
+        # Flag to track if Broyden update was skipped
+        skip_update = False
 
-        if trust_region:
+        if not iter == 0:
+            # Compute denominator for Broyden update
+            denominator = dx_i @ self.Binv @ df_i
+
+            # DEBUG: Check for numerical instability
+            import numpy as np
+            print(f"\n{'='*80}")
+            print(f"DEBUG optqn.py:202 - Broyden Update (iter {iter})")
+            print(f"{'='*80}")
+            print(f"||dx_i|| = {np.linalg.norm(dx_i):.6e}")
+            print(f"||df_i|| = {np.linalg.norm(df_i):.6e}")
+            print(f"denominator (dx_i @ Binv @ df_i) = {denominator:.6e}")
+            print(f"Max abs value in dx_i: {np.max(np.abs(dx_i)):.6e}")
+            print(f"Max abs value in df_i: {np.max(np.abs(df_i)):.6e}")
+
+            # Enhanced safeguards for Broyden stability
+            min_denominator = 1e-12
+            max_allowed_step = 2.0  # Limit chemical potential changes to 2 Ha
+            max_allowed_update = 1e2  # Much more conservative: 100 instead of 1000
+            max_allowed_binv = 10.0   # Limit maximum values in Binv matrix
+            
+            if abs(denominator) < min_denominator:
+                print(f"⚠️  WARNING: Denominator too small ({denominator:.6e} < {min_denominator:.6e})")
+                print(f"⚠️  Skipping Broyden update to prevent numerical explosion")
+                print(f"{'='*80}\n")
+                skip_update = True
+            else:
+                # Standard Broyden update
+                tmp__ = outer(dx_i - self.Binv @ df_i, dx_i @ self.Binv) / denominator
+                max_update = np.max(np.abs(tmp__))
+                print(f"Max abs value in Broyden update: {max_update:.6e}")
+
+                # Scale down large updates more aggressively
+                if max_update > max_allowed_update:
+                    print(f"⚠️  WARNING: Broyden update too large ({max_update:.6e} > {max_allowed_update:.6e})")
+                    scale_factor = max_allowed_update / max_update
+                    tmp__ *= scale_factor
+                    print(f"Applied scale factor: {scale_factor:.6e}")
+
+                self.Binv += tmp__
+                
+                # Additional safeguard: clamp Binv values to prevent matrix corruption
+                max_binv_before = np.max(np.abs(self.Binv))
+                if max_binv_before > max_allowed_binv:
+                    print(f"⚠️  WARNING: Binv matrix too large ({max_binv_before:.6e} > {max_allowed_binv:.6e})")
+                    print(f"⚠️  Clamping Binv values to prevent matrix corruption")
+                    self.Binv = np.clip(self.Binv, -max_allowed_binv, max_allowed_binv)
+                
+                print(f"Max abs value in Binv after update: {np.max(np.abs(self.Binv)):.6e}")
+                
+                # Additional check: limit the step size to prevent large chemical potential jumps
+                step_proposal = -self.Binv @ self.fold
+                max_step = np.max(np.abs(step_proposal))
+                if max_step > max_allowed_step:
+                    print(f"⚠️  WARNING: Proposed step too large ({max_step:.6f} Ha > {max_allowed_step:.6f} Ha)")
+                    print(f"⚠️  Chemical potential changes should be modest for stability")
+                    # Don't apply additional damping here - let line search handle it
+                
+                print(f"{'='*80}\n")
+
+        # If Broyden update was skipped, also skip line search
+        # (optimization has stalled, keep current potentials)
+        if skip_update:
+            # Keep xnew = xold, fnew = fold (no change)
+            self.xnew = self.xold.copy()
+            self.fnew = self.fold.copy()
+        elif trust_region:
             self.xnew, self.fnew = trustRegion(
                 self.func, self.xold, self.fold, self.Binv, c=self.trust
             )

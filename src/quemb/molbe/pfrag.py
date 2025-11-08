@@ -280,7 +280,29 @@ class Frags:
                 @ self._mo_coeffs[:, : self.nsocc].conj().T
             )
 
-        mf_ = get_scfObj(self.fock + heff, eri, self.nsocc, dm0=dm0)
+        # Store the effective h1e for VQE to use
+        # This is EXACTLY what gets passed to SCF, ensuring VQE uses the same Hamiltonian
+
+        # DEBUG: Print detailed info about fock and heff before addition
+        import numpy as np
+        print(f"\n{'='*80}")
+        print(f"DEBUG pfrag.py:285 - Fragment {self.dname}")
+        print(f"{'='*80}")
+        print(f"self.fock.shape: {self.fock.shape}, dtype: {self.fock.dtype}")
+        print(f"heff.shape: {heff.shape}, dtype: {heff.dtype}")
+        print(f"\nself.fock diagonal: {np.diag(self.fock)}")
+        print(f"heff diagonal: {np.diag(heff)}")
+        print(f"\nself.fock matrix:\n{self.fock}")
+        print(f"\nheff matrix:\n{heff}")
+
+        self._effective_h1e = self.fock + heff
+
+        print(f"\n_effective_h1e diagonal: {np.diag(self._effective_h1e)}")
+        print(f"_effective_h1e matrix:\n{self._effective_h1e}")
+        print(f"Max abs value in _effective_h1e: {np.max(np.abs(self._effective_h1e)):.6e}")
+        print(f"{'='*80}\n")
+
+        mf_ = get_scfObj(self._effective_h1e, eri, self.nsocc, dm0=dm0)
         if not fs:
             self._mf = mf_
             self.mo_coeffs = mf_.mo_coeff.copy()

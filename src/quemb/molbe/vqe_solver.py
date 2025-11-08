@@ -9,17 +9,22 @@ This module implements a VQE solver with:
 - Jordan-Wigner fermion-to-qubit mapping
 - Statevector simulation for exact RDM calculation
 - Warm-start capability for BE iterations
+- Optional diagnostics for iteration-level convergence traces
 """
 
-import re
+from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Literal
 from warnings import warn
+from time import perf_counter
 
+import h5py
 import numpy as np
 from attrs import Factory, define, field
 from numpy import ndarray
+from pyscf import ao2mo
 from pyscf.scf.hf import RHF
+from pyscf.tools import fcidump
 
 from quemb.molbe.pfrag import Frags
 from quemb.shared.typing import Matrix
@@ -30,11 +35,12 @@ try:
     from qiskit.circuit import Parameter
     from qiskit.primitives import BackendEstimatorV2
     from qiskit.quantum_info import SparsePauliOp, Statevector
-    from qiskit_algorithms.optimizers import COBYLA
+    from qiskit_algorithms.optimizers import COBYLA, L_BFGS_B, SPSA, SLSQP
     from qiskit_algorithms import VQE as QiskitVQE
     from qiskit_algorithms.exceptions import AlgorithmError
+    from qiskit_nature.second_q.hamiltonians import ElectronicEnergy
     from qiskit_nature.second_q.mappers import JordanWignerMapper
-    from qiskit_nature.second_q.operators import FermionicOp
+    from qiskit_nature.second_q.operators import ElectronicIntegrals, FermionicOp
     from qiskit_aer import AerSimulator
 
     QISKIT_AVAILABLE = True
@@ -44,6 +50,8 @@ except ImportError as e:
     SparsePauliOp = Any  # type: ignore
     Statevector = Any  # type: ignore
     QuantumCircuit = Any  # type: ignore
+    ElectronicEnergy = Any  # type: ignore
+    ElectronicIntegrals = Any  # type: ignore
 
     warn(
         f"Qiskit not available. VQE solver will not work. "
@@ -92,11 +100,23 @@ class VQE_ArgsUser:
     stage3_energy_tol : float
         Energy convergence tolerance for stage 3. Default: 1e-6
 
-    # COBYLA optimizer settings
+    # Optimizer settings
+    optimizer_name : str
+        Optimizer to use ('SPSA', 'COBYLA', 'L_BFGS_B', 'SLSQP'). Default: 'SPSA'
     cobyla_rhobeg : float
         Initial step size for COBYLA. Default: 0.1
     cobyla_rhoend : float
         Final step size for COBYLA. Default: 1e-6
+
+    max_restarts : int
+        Number of optimizer runs to attempt (including the first run). Each
+        additional run starts from a random initial point; the lowest-energy
+        solution is selected. Default: 3
+    restart_energy_tol : float
+        Skip further restarts when the improvement of the best energy falls
+        below this threshold. Default: 1e-6
+    random_seed : int | None
+        Seed for random initial points. Default: None (use entropy)
 
     # Warm start settings
     warm_start : bool
@@ -110,6 +130,17 @@ class VQE_ArgsUser:
         1: BE iteration info
         2: VQE convergence info
         3: Full debug output
+    show_progress_bar : bool
+        Display a textual progress bar during optimizer evaluations. Default: False
+    track_iteration_history : bool
+        Record optimizer iteration diagnostics for later inspection.
+        Default: False
+    track_density_matrices : bool
+        Compute intermediate one-particle density matrices at callback checkpoints.
+        Default: False
+    density_sample_interval : int
+        Interval (in optimizer evaluations) between density matrix captures when
+        ``track_density_matrices`` is enabled. Default: 1
     """
 
     hamiltonian_dir: Final[str] = "store_h10_files/be2/"
@@ -131,15 +162,28 @@ class VQE_ArgsUser:
     stage3_max_iter: Final[int] = 200
     stage3_energy_tol: Final[float] = 1e-6
 
+    # Optimizer selection
+    optimizer_name: Final[str] = "SPSA"  # Changed from COBYLA: SPSA reduces fragment asymmetry by 49%
+    
     # COBYLA optimizer
     cobyla_rhobeg: Final[float] = 0.1
     cobyla_rhoend: Final[float] = 1e-6
+
+    # Restart settings
+    max_restarts: Final[int] = 3
+    restart_energy_tol: Final[float] = 1e-6
+    random_seed: Final[int | None] = None
 
     # Warm start
     warm_start: Final[bool] = True
 
     # Verbosity
     verbose: Final[int] = 0
+    # Diagnostics / tracing
+    show_progress_bar: Final[bool] = False
+    track_iteration_history: Final[bool] = False
+    track_density_matrices: Final[bool] = False
+    density_sample_interval: Final[int] = 1
 
 
 class VQEState:
@@ -152,6 +196,11 @@ class VQEState:
         self.fragment_params: dict[str, ndarray] = {}  # frag_name -> optimal parameters
         self.be_energy_history: list[float] = []  # BE iteration energies
         self.current_be_iter: int = 0
+        self.fragment_iteration_history: dict[str, list[dict[str, Any]]] = {}
+        self.fragment_energies: dict[str, float] = {}
+        self.fragment_rdm1: dict[str, ndarray] = {}
+        self.fragment_rdm2: dict[str, ndarray] = {}
+        self.fragment_timings: dict[str, dict[str, float]] = {}
 
     def get_stage(self, be_energy_change: float, args: VQE_ArgsUser) -> int:
         """Determine VQE convergence stage based on BE convergence."""
@@ -194,12 +243,6 @@ def parse_fcidump_hamiltonian(filepath: Path) -> tuple[SparsePauliOp, int, int, 
     """
     Parse FCIDUMP-format Hamiltonian file.
 
-    File format:
-    &FCI NORB=N, NELEC=M, MS2=S, ...
-    value  p  q  r  s   (two-electron integrals)
-    value  p  q  0  0   (one-electron integrals)
-    value  0  0  0  0   (core energy)
-
     Parameters
     ----------
     filepath : Path
@@ -210,98 +253,35 @@ def parse_fcidump_hamiltonian(filepath: Path) -> tuple[SparsePauliOp, int, int, 
     hamiltonian : SparsePauliOp
         Qubit Hamiltonian in Pauli operator form
     norb : int
-        Number of orbitals
+        Number of spatial orbitals
     nelec : int
         Number of electrons
     core_energy : float
-        Nuclear/core repulsion energy
+        Core/nuclear energy shift (not included in the qubit Hamiltonian)
     """
     if not QISKIT_AVAILABLE:
         raise ImportError("Qiskit is required for VQE solver")
 
-    with open(filepath, 'r') as f:
-        lines = f.readlines()
+    fc_data = fcidump.read(str(filepath))
 
-    # Parse header
-    header = lines[0]
-    norb_match = re.search(r'NORB\s*=\s*(\d+)', header)
-    nelec_match = re.search(r'NELEC\s*=\s*(\d+)', header)
+    norb = int(fc_data["NORB"])
+    nelec = int(fc_data["NELEC"])
+    core_energy = float(fc_data["ECORE"])
 
-    if not norb_match or not nelec_match:
-        raise ValueError(f"Could not parse NORB/NELEC from header: {header}")
+    h1 = np.asarray(fc_data["H1"], dtype=float)
+    # Restore the full two-electron tensor in chemists' notation <pq|rs>
+    h2 = ao2mo.restore(1, fc_data["H2"], norb)
 
-    norb = int(norb_match.group(1))
-    nelec = int(nelec_match.group(1))
-
-    # Parse integrals
-    h1 = np.zeros((norb, norb))  # One-electron integrals
-    h2 = np.zeros((norb, norb, norb, norb))  # Two-electron integrals
-    core_energy = 0.0
-
-    for line in lines[4:]:  # Skip header lines
-        parts = line.strip().split()
-        if len(parts) < 5:
-            continue
-
-        value = float(parts[0])
-        p, q, r, s = int(parts[1]), int(parts[2]), int(parts[3]), int(parts[4])
-
-        if p == 0 and q == 0 and r == 0 and s == 0:
-            # Core energy
-            core_energy = value
-        elif r == 0 and s == 0:
-            # One-electron integral (convert to 0-indexed)
-            h1[p-1, q-1] = value
-            if p != q:
-                h1[q-1, p-1] = value  # Hermitian
-        else:
-            # Two-electron integral (convert to 0-indexed)
-            h2[p-1, q-1, r-1, s-1] = value
-
-    # Build FermionicOp Hamiltonian using spin orbitals
-    # We need to convert spatial orbitals to spin orbitals
-    # For each spatial orbital p, we have spin orbitals 2*p (alpha) and 2*p+1 (beta)
-    fermionic_terms = {}
-
-    # One-electron terms: sum over spin
-    for p in range(norb):
-        for q in range(norb):
-            if abs(h1[p, q]) > 1e-12:
-                # Alpha spin
-                term_alpha = f"+_{2*p} -_{2*q}"
-                fermionic_terms[term_alpha] = h1[p, q]
-                # Beta spin
-                term_beta = f"+_{2*p+1} -_{2*q+1}"
-                fermionic_terms[term_beta] = h1[p, q]
-
-    # Two-electron terms: sum over spins
-    # H2 in FCIDUMP is in physicist's notation: <pq|rs>
-    # Hamiltonian term: 0.5 * sum_pqrs <pq|rs> a+_p a+_q a_s a_r
-    for p in range(norb):
-        for q in range(norb):
-            for r in range(norb):
-                for s in range(norb):
-                    if abs(h2[p, q, r, s]) > 1e-12:
-                        coeff = 0.5 * h2[p, q, r, s]
-
-                        # Alpha-alpha interaction
-                        term = f"+_{2*p} +_{2*q} -_{2*s} -_{2*r}"
-                        fermionic_terms[term] = fermionic_terms.get(term, 0.0) + coeff
-
-                        # Alpha-beta interaction
-                        term = f"+_{2*p} +_{2*q+1} -_{2*s+1} -_{2*r}"
-                        fermionic_terms[term] = fermionic_terms.get(term, 0.0) + coeff
-
-                        # Beta-alpha interaction
-                        term = f"+_{2*p+1} +_{2*q} -_{2*s} -_{2*r+1}"
-                        fermionic_terms[term] = fermionic_terms.get(term, 0.0) + coeff
-
-                        # Beta-beta interaction
-                        term = f"+_{2*p+1} +_{2*q+1} -_{2*s+1} -_{2*r+1}"
-                        fermionic_terms[term] = fermionic_terms.get(term, 0.0) + coeff
-
-    # Create FermionicOp
-    fermionic_op = FermionicOp(fermionic_terms, num_spin_orbitals=2*norb)
+    # Build fermionic Hamiltonian using Qiskit Nature helpers (handles spin expansion)
+    electronic_integrals = ElectronicIntegrals.from_raw_integrals(
+        h1_a=h1,
+        h2_aa=h2,
+        h1_b=h1,
+        h2_bb=h2,
+        h2_ba=np.einsum("pqrs->qprs", h2),
+    )
+    electronic_energy = ElectronicEnergy(electronic_integrals)
+    fermionic_op = electronic_energy.second_q_op()
 
     # Map to qubits using Jordan-Wigner
     mapper = JordanWignerMapper()
@@ -348,9 +328,10 @@ def build_uccsd_ansatz(norb: int, nelec: int) -> QuantumCircuit:
 
     mapper = JordanWignerMapper()
 
-    # For RHF (restricted, closed-shell), we assume all electrons are spin-up
-    # nelec total electrons means nelec/2 alpha, nelec/2 beta for closed shell
-    # But for odd nelec, we use (nelec+1)//2 alpha, nelec//2 beta
+    # For BE fragments: spin configuration depends on electron count
+    # Odd nelec: use balanced (gives doublet S=1/2)
+    # Even nelec: use balanced (gives singlet S=0)
+    # Note: balanced means n_alpha = (nelec+1)//2, n_beta = nelec - n_alpha
     n_alpha = (nelec + 1) // 2
     n_beta = nelec - n_alpha
     num_particles = (n_alpha, n_beta)
@@ -367,6 +348,48 @@ def build_uccsd_ansatz(norb: int, nelec: int) -> QuantumCircuit:
     )
 
     return ansatz
+
+
+def compute_rdm1_from_statevector(
+    statevector: Statevector,
+    norb: int,
+    nelec: int,  # noqa: ARG001 - kept for signature parity with full RDM helper
+) -> ndarray:
+    """
+    Compute 1-RDM from a VQE statevector.
+
+    Parameters
+    ----------
+    statevector : Statevector
+        Optimized or intermediate VQE statevector.
+    norb : int
+        Number of spatial orbitals.
+    nelec : int
+        Number of electrons (unused but retained for future extensions).
+
+    Returns
+    -------
+    ndarray
+        One-particle reduced density matrix (real-valued).
+    """
+    if not QISKIT_AVAILABLE:
+        raise ImportError("Qiskit is required for VQE solver")
+
+    nqubits = 2 * norb
+    mapper = JordanWignerMapper()
+    rdm1 = np.zeros((norb, norb), dtype=complex)
+
+    for p in range(norb):
+        for q in range(norb):
+            value = 0.0 + 0.0j
+            for spin in (0, 1):  # 0 -> alpha, 1 -> beta
+                op_str = f"+_{2 * p + spin} -_{2 * q + spin}"
+                fermionic_op = FermionicOp({op_str: 1.0}, num_spin_orbitals=nqubits)
+                pauli_op = mapper.map(fermionic_op)
+                value += statevector.expectation_value(pauli_op)
+            rdm1[p, q] = value
+
+    return rdm1.real
 
 
 def compute_rdms_from_statevector(
@@ -403,40 +426,134 @@ def compute_rdms_from_statevector(
     # Initialize RDMs
     rdm1 = np.zeros((norb, norb), dtype=complex)
     rdm2 = np.zeros((norb, norb, norb, norb), dtype=complex)
+    mapper = JordanWignerMapper()
+    spin_labels = (0, 1)
+    spin_configs = (
+        (0, 0, 0, 0),  # αα
+        (0, 1, 1, 0),  # αβ
+        (1, 0, 0, 1),  # βα
+        (1, 1, 1, 1),  # ββ
+    )
 
     # 1-RDM: <a+_p a_q>
     for p in range(norb):
         for q in range(norb):
-            # Spin-up sector only (since we have RHF with beta=0)
-            op_str = f"+_{p} -_{q}"
-            fermionic_op = FermionicOp({op_str: 1.0}, num_spin_orbitals=nqubits)
-
-            mapper = JordanWignerMapper()
-            pauli_op = mapper.map(fermionic_op)
-
-            # Expectation value
-            rdm1[p, q] = statevector.expectation_value(pauli_op)
+            value = 0.0 + 0.0j
+            for spin in spin_labels:
+                op_str = f"+_{2 * p + spin} -_{2 * q + spin}"
+                fermionic_op = FermionicOp({op_str: 1.0}, num_spin_orbitals=nqubits)
+                pauli_op = mapper.map(fermionic_op)
+                value += statevector.expectation_value(pauli_op)
+            rdm1[p, q] = value
 
     # 2-RDM: <a+_p a+_q a_s a_r>
     for p in range(norb):
         for q in range(norb):
             for r in range(norb):
                 for s in range(norb):
-                    # Spin-up sector only
-                    op_str = f"+_{p} +_{q} -_{s} -_{r}"
-                    fermionic_op = FermionicOp({op_str: 1.0}, num_spin_orbitals=nqubits)
-
-                    mapper = JordanWignerMapper()
-                    pauli_op = mapper.map(fermionic_op)
-
-                    # Expectation value
-                    rdm2[p, q, r, s] = statevector.expectation_value(pauli_op)
+                    value = 0.0 + 0.0j
+                    for spin_p, spin_q, spin_s, spin_r in spin_configs:
+                        op_str = (
+                            f"+_{2 * p + spin_p} +_{2 * q + spin_q} "
+                            f"-_{2 * s + spin_s} -_{2 * r + spin_r}"
+                        )
+                        fermionic_op = FermionicOp({op_str: 1.0}, num_spin_orbitals=nqubits)
+                        pauli_op = mapper.map(fermionic_op)
+                        value += statevector.expectation_value(pauli_op)
+                    rdm2[p, q, r, s] = value
 
     # Convert to real (imaginary parts should be negligible)
     rdm1 = rdm1.real
     rdm2 = rdm2.real
 
     return rdm1, rdm2
+
+
+def regenerate_fcidump_with_heff(
+    frag: Frags,
+    output_dir: str | Path,
+) -> Path:
+    """
+    Regenerate FCIDUMP file with current effective Hamiltonian.
+
+    This function creates a new FCIDUMP file that uses the CURRENT
+    one-electron Hamiltonian from the most recent SCF calculation.
+    This is essential for VQE to see BE optimization updates.
+
+    Parameters
+    ----------
+    frag : Frags
+        Fragment object with _effective_h1e stored from recent SCF
+    output_dir : str or Path
+        Directory to write updated FCIDUMP file
+
+    Returns
+    -------
+    Path
+        Path to the regenerated FCIDUMP file
+
+    Notes
+    -----
+    The Hamiltonian is extracted from frag._effective_h1e, which is
+    explicitly stored in pfrag.py:285 when SCF is called.
+
+    This equals frag.fock + frag.heff at the time SCF was called,
+    ensuring VQE uses EXACTLY the same Hamiltonian that was passed
+    to get_scfObj() on pfrag.py:287.
+
+    Why use explicit storage instead of computing frag.fock + frag.heff?
+    - frag.fock is STATIC (set once at initialization, never updated)
+    - frag._effective_h1e is CURRENT (stored when SCF runs with updated heff)
+    - This ensures VQE sees chemical potential updates across BE iterations
+
+    This addresses the bug where VQE was reading static FCIDUMP files
+    that never received updates during BE optimization.
+    """
+    # Load 2-electron integrals from HDF5 file
+    with h5py.File(frag.eri_file, "r") as f:
+        eri = f[frag.dname][()]
+    eri = ao2mo.restore(1, eri, frag.nao)
+
+    # Get CURRENT effective one-electron Hamiltonian that was used in SCF
+    # This is stored explicitly in pfrag.py:285 when SCF is called
+    # It equals: frag.fock + frag.heff (at the time SCF was called)
+    # This ensures VQE uses EXACTLY the same Hamiltonian as traditional solvers
+    assert hasattr(frag, '_effective_h1e'), "SCF must be run before regenerating FCIDUMP"
+    h1e = frag._effective_h1e
+
+    # 2-electron integrals remain unchanged
+    h2e = eri
+
+    # Write to FCIDUMP file with unique name to avoid race conditions
+    output_path = Path(output_dir)
+    output_file = output_path / f"h10_{frag.dname}_current"
+
+    # DEBUG: Print what we're about to write to FCIDUMP
+    import numpy as np
+    print(f"\n{'='*80}")
+    print(f"DEBUG vqe_solver.py:526 - About to write FCIDUMP")
+    print(f"{'='*80}")
+    print(f"h1e.shape: {h1e.shape}")
+    print(f"h1e diagonal: {np.diag(h1e)}")
+    print(f"h2e.shape: {h2e.shape}")
+    print(f"frag.TA.shape: {frag.TA.shape}")
+    print(f"frag.TA.shape[1] (norb): {frag.TA.shape[1]}")
+    print(f"frag.nsocc (spatial orbitals): {frag.nsocc}")
+    print(f"2 * frag.nsocc (total electrons): {2 * frag.nsocc}")
+    print(f"frag.nao: {frag.nao}")
+    print(f"h1e matrix:\n{h1e}")
+    print(f"{'='*80}\n")
+
+    fcidump.from_integrals(
+        str(output_file),
+        h1e,
+        h2e,
+        frag.TA.shape[1],  # Number of orbitals
+        2 * frag.nsocc,    # Number of electrons (total electrons: 2 * spatial orbitals)
+        ms=0,              # Total spin
+    )
+
+    return output_file
 
 
 def solve_vqe(
@@ -481,6 +598,9 @@ def solve_vqe(
 
     global _vqe_state
 
+    global_start = perf_counter()
+    phase_timings: dict[str, float] = {}
+
     # Update BE iteration tracking
     if be_energy is not None:
         _vqe_state.update_be_iteration(be_energy)
@@ -495,20 +615,19 @@ def solve_vqe(
               f"BE ΔE={be_energy_change:.2e}, "
               f"max_iter={max_iter}, tol={energy_tol:.2e}")
 
-    # Load Hamiltonian from file
+    # Regenerate FCIDUMP with current effective Hamiltonian
+    # This ensures VQE sees the updated chemical potential from BE optimization
     ham_dir = Path(vqe_args.hamiltonian_dir)
-    # Fragment name should match file pattern, e.g., "be2f0" -> "h10_be2f0"
-    frag_name = str(frag.dname)  # e.g., "be2f0"
-    ham_file = ham_dir / f"h10_{frag_name}"
+    frag_name = str(frag.dname)  # Needed for warm-start logic
+    ham_file = regenerate_fcidump_with_heff(frag, ham_dir)
 
-    if not ham_file.exists():
-        raise FileNotFoundError(
-            f"Hamiltonian file not found: {ham_file}\n"
-            f"Expected format: {vqe_args.hamiltonian_dir}/h10_{{fragment_name}}"
-        )
+    if vqe_args.verbose >= 2:
+        print(f"  Regenerated FCIDUMP with current heff: {ham_file}")
 
-    # Parse Hamiltonian
+    # Parse Hamiltonian (now includes current chemical potential)
     qubit_hamiltonian, norb, nelec, core_energy = parse_fcidump_hamiltonian(ham_file)
+    t_after_parse = perf_counter()
+    phase_timings["load_hamiltonian"] = t_after_parse - global_start
 
     if vqe_args.verbose >= 2:
         print(f"  Loaded Hamiltonian: norb={norb}, nelec={nelec}, "
@@ -520,23 +639,57 @@ def solve_vqe(
     # Transpile ansatz to decompose high-level gates (EvolvedOps) into basic gates
     # This is required for Aer compatibility
     ansatz = transpile(ansatz, basis_gates=['u1', 'u2', 'u3', 'cx'], optimization_level=1)
+    t_after_ansatz = perf_counter()
+    phase_timings["build_ansatz"] = t_after_ansatz - t_after_parse
+    ordered_parameters = list(ansatz.parameters)
+    num_parameters = len(ordered_parameters)
 
     # Initial parameters (warm-start or cold-start)
     if vqe_args.warm_start and frag_name in _vqe_state.fragment_params:
         initial_point = _vqe_state.fragment_params[frag_name]
-        if vqe_args.verbose >= 2:
+        if len(initial_point) != num_parameters:
+            if vqe_args.verbose >= 1:
+                print(
+                    f"  Warm-start parameter length {len(initial_point)} mismatch "
+                    f"with ansatz size {num_parameters}; reinitializing."
+                )
+            initial_point = np.zeros(num_parameters)
+        elif vqe_args.verbose >= 2:
             print(f"  Using warm-start parameters (size={len(initial_point)})")
     else:
-        initial_point = np.zeros(ansatz.num_parameters)
+        initial_point = np.zeros(num_parameters)
         if vqe_args.verbose >= 2:
             print(f"  Using cold-start (zeros, size={len(initial_point)})")
 
-    # Setup COBYLA optimizer
-    # Note: Qiskit 2.x COBYLA doesn't accept rhobeg/rhoend directly
-    optimizer = COBYLA(
-        maxiter=max_iter,
-        tol=energy_tol,
-    )
+    t_after_initial = perf_counter()
+    phase_timings["initial_parameters"] = t_after_initial - t_after_ansatz
+
+    # Setup optimizer based on selection
+    optimizer_name = vqe_args.optimizer_name
+    print(f"  Using optimizer: {optimizer_name}")
+    
+    if optimizer_name == "COBYLA":
+        optimizer = COBYLA(
+            maxiter=max_iter,
+            tol=energy_tol,
+        )
+    elif optimizer_name == "L_BFGS_B":
+        optimizer = L_BFGS_B(
+            maxiter=max_iter,
+            ftol=energy_tol,
+        )
+    elif optimizer_name == "SPSA":
+        optimizer = SPSA(
+            maxiter=max_iter,
+            callback=None,  # We'll use VQE callback instead
+        )
+    elif optimizer_name == "SLSQP":
+        optimizer = SLSQP(
+            maxiter=max_iter,
+            ftol=energy_tol,
+        )
+    else:
+        raise ValueError(f"Unknown optimizer: {optimizer_name}. Use COBYLA, L_BFGS_B, SPSA, or SLSQP")
 
     # Setup VQE with Aer backend (GPU or multi-threaded CPU)
     # Check environment variable for device preference
@@ -570,60 +723,432 @@ def solve_vqe(
         )
         if vqe_args.verbose >= 1:
             print(f"  Using Aer CPU backend with {max_threads} threads")
-    
-    def build_vqe(selected_backend: AerSimulator) -> QiskitVQE:
-        estimator_local = BackendEstimatorV2(backend=selected_backend)
-        return QiskitVQE(estimator_local, ansatz, optimizer, initial_point=initial_point)
 
-    vqe = build_vqe(backend)
+    t_after_backend = perf_counter()
+    phase_timings["backend_setup"] = t_after_backend - t_after_initial
 
-    # Run VQE
-    if vqe_args.verbose >= 2:
-        print(f"  Running VQE optimization...")
+    rng = np.random.default_rng(vqe_args.random_seed)
+    progress_bar_enabled = vqe_args.show_progress_bar and max_iter > 0
+    progress_bar_width = 30
+    callback_needed = (
+        vqe_args.track_iteration_history
+        or vqe_args.track_density_matrices
+        or vqe_args.verbose >= 2
+        or progress_bar_enabled
+    )
+    interval = max(vqe_args.density_sample_interval, 1)
 
-    try:
-        result = vqe.compute_minimum_eigenvalue(qubit_hamiltonian)
-    except AlgorithmError as exc:
-        if device == 'GPU':
-            if vqe_args.verbose >= 1:
-                print(f"  GPU execution failed ({exc}); retrying on CPU backend")
-            max_threads = int(os.environ.get('OMP_NUM_THREADS', '8'))
-            cpu_backend = AerSimulator(
-                method='statevector',
-                device='CPU',
-                max_parallel_threads=max_threads
+    def _build_param_dict(values: Any) -> dict[Parameter, float] | None:
+        try:
+            vector = np.asarray(values, dtype=float).reshape(-1)
+        except Exception:
+            return None
+        if vector.size < num_parameters:
+            return None
+        if vector.size > num_parameters:
+            vector = vector[:num_parameters]
+        return {
+            ordered_parameters[idx]: float(vector[idx])
+            for idx in range(num_parameters)
+        }
+
+    def execute_vqe(initial_point: np.ndarray, run_index: int, label: str) -> dict[str, Any]:
+        records: list[dict[str, Any]] = []
+        prev_energy: float | None = None
+        prev_rdm1: ndarray | None = None
+        callback_start_time = 0.0
+        last_callback_time = 0.0
+        progress_last_eval = -1
+        progress_bar_drawn = False
+
+        def render_progress(eval_count: int) -> None:
+            nonlocal progress_last_eval, progress_bar_drawn
+            if not progress_bar_enabled:
+                return
+            eval_int = int(eval_count)
+            if eval_int == progress_last_eval:
+                return
+            progress_last_eval = eval_int
+            clamped_eval = min(max(eval_int, 0), max_iter)
+            fraction = clamped_eval / max_iter if max_iter else 1.0
+            filled = min(progress_bar_width, int(fraction * progress_bar_width))
+            bar = "#" * filled + "-" * (progress_bar_width - filled)
+            print(
+                f"  Progress [{bar}] {fraction * 100:6.2f}% ({clamped_eval}/{max_iter})",
+                end="",
+                flush=True,
             )
-            if vqe_args.verbose >= 1:
-                print(f"  Using Aer CPU backend with {max_threads} threads")
-            vqe = build_vqe(cpu_backend)
+            progress_bar_drawn = True
+
+        interval_local = interval
+
+        def vqe_callback(eval_count: int, parameters: np.ndarray, mean: float, metadata: Any):  # type: ignore[override]
+            nonlocal prev_energy, prev_rdm1, last_callback_time, callback_start_time
+
+            energy_raw = float(np.real(mean))
+            energy_total = energy_raw + core_energy
+            record: dict[str, Any] = {
+                "eval_count": int(eval_count),
+                "energy": energy_total,
+                "raw_energy": energy_raw,
+            }
+
+            current_time = perf_counter()
+            if callback_start_time == 0.0:
+                callback_start_time = current_time
+            if last_callback_time == 0.0:
+                last_callback_time = current_time
+            record["elapsed_time"] = current_time - callback_start_time
+            record["delta_time"] = current_time - last_callback_time
+            last_callback_time = current_time
+
+            std_dev_val: float | None = None
+            if metadata is not None:
+                if isinstance(metadata, dict):
+                    variance = metadata.get("variance") or metadata.get("variances")
+                    if variance is not None:
+                        if isinstance(variance, (list, tuple, np.ndarray)):
+                            if len(variance) > 0:
+                                var_value = float(variance[0])
+                                std_dev_val = float(np.sqrt(max(var_value, 0.0)))
+                        else:
+                            var_value = float(variance)
+                            std_dev_val = float(np.sqrt(max(var_value, 0.0)))
+                    std_dev_candidate = metadata.get("stddev") or metadata.get("standard_error")
+                    if std_dev_candidate is not None and std_dev_val is None:
+                        if isinstance(std_dev_candidate, (list, tuple, np.ndarray)):
+                            if len(std_dev_candidate) > 0:
+                                std_dev_val = float(std_dev_candidate[0])
+                        else:
+                            std_dev_val = float(std_dev_candidate)
+                elif isinstance(metadata, (float, int, np.floating)):
+                    std_dev_val = float(metadata)
+
+            if std_dev_val is not None:
+                record["stddev"] = std_dev_val
+
+            delta_energy = energy_total - prev_energy if prev_energy is not None else None
+            record["delta_energy"] = delta_energy
+            prev_energy = energy_total
+
+            if progress_bar_enabled:
+                render_progress(eval_count)
+
+            if vqe_args.track_density_matrices:
+                compute_density = (eval_count % interval_local == 0) or prev_rdm1 is None
+                if compute_density:
+                    param_binding = _build_param_dict(parameters)
+                    if param_binding is not None:
+                        density_t0 = perf_counter()
+                        bound_circuit = ansatz.assign_parameters(param_binding)
+                        statevector_iter = Statevector(bound_circuit)
+                        rdm1_iter = compute_rdms_from_statevector(statevector_iter, norb, nelec)
+                        record["rdm1_trace"] = float(np.trace(rdm1_iter))
+                        if prev_rdm1 is not None:
+                            record["rdm1_delta"] = float(np.linalg.norm(rdm1_iter - prev_rdm1))
+                        else:
+                            record["rdm1_delta"] = None
+                        record["rdm1_matrix"] = rdm1_iter
+                        prev_rdm1 = rdm1_iter
+                        record["density_time"] = perf_counter() - density_t0
+                    else:
+                        record["rdm1_trace"] = None
+                        record["rdm1_delta"] = None
+                        record["rdm1_matrix"] = None
+                        record["density_time"] = None
+                else:
+                    record["rdm1_trace"] = None
+                    record["rdm1_delta"] = None
+                    record["rdm1_matrix"] = None
+                    record["density_time"] = None
+            else:
+                record["density_time"] = None
+
+            records.append(record)
+
+            if vqe_args.verbose >= 2:
+                delta_str = (
+                    f" ΔE={delta_energy:+.3e}" if delta_energy is not None else ""
+                )
+                std_str = (
+                    f" σ={record['stddev']:.2e}" if record.get("stddev") is not None else ""
+                )
+                density_str = ""
+                if vqe_args.track_density_matrices:
+                    rdm_delta = record.get("rdm1_delta")
+                    if rdm_delta is not None:
+                        density_str = f" Δ||ρ||={rdm_delta:+.3e}"
+                print(
+                    f"    iter {eval_count:>3}: E={energy_total:.10f} Ha{delta_str}{std_str}{density_str}"
+                )
+
+        if vqe_args.verbose >= 1:
+            print(f"  VQE restart {run_index + 1} ({label})", flush=True)
+
+        def build_vqe(selected_backend: AerSimulator, init_point: np.ndarray) -> QiskitVQE:
+            estimator_local = BackendEstimatorV2(backend=selected_backend)
+            vqe_kwargs: dict[str, Any] = {"initial_point": init_point}
+            if callback_needed:
+                vqe_kwargs["callback"] = vqe_callback
+            return QiskitVQE(estimator_local, ansatz, optimizer, **vqe_kwargs)
+
+        vqe = build_vqe(backend, initial_point)
+
+        if vqe_args.verbose >= 2:
+            print(f"  Running VQE optimization...")
+
+        optimization_start = perf_counter()
+        pre_opt = optimization_start - t_after_backend
+
+        try:
             result = vqe.compute_minimum_eigenvalue(qubit_hamiltonian)
-        else:
-            raise
+        except AlgorithmError as exc:
+            if device == 'GPU':
+                if vqe_args.verbose >= 1:
+                    print(f"  GPU execution failed ({exc}); retrying on CPU backend")
+                max_threads = int(os.environ.get('OMP_NUM_THREADS', '8'))
+                cpu_backend = AerSimulator(
+                    method='statevector',
+                    device='CPU',
+                    max_parallel_threads=max_threads
+                )
+                if vqe_args.verbose >= 1:
+                    print(f"  Using Aer CPU backend with {max_threads} threads")
+                vqe = build_vqe(cpu_backend, initial_point)
+                result = vqe.compute_minimum_eigenvalue(qubit_hamiltonian)
+            else:
+                raise
+        opt_end = perf_counter()
+        optimizer_time = opt_end - optimization_start
+        if progress_bar_enabled:
+            render_progress(result.cost_function_evals)
+            if progress_bar_drawn:
+                print()
 
-    # Extract results
-    optimal_energy = result.eigenvalue.real + core_energy
-    optimal_params = result.optimal_point
+        optimal_energy = result.eigenvalue.real + core_energy
+        optimal_params = np.asarray(result.optimal_point, dtype=float)
 
-    if vqe_args.verbose >= 1:
-        print(f"  VQE converged: E={optimal_energy:.8f}, "
-              f"iterations={result.cost_function_evals}")
+        if vqe_args.verbose >= 1:
+            print(
+                f"  VQE converged: E={optimal_energy:.8f}, "
+                f"iterations={result.cost_function_evals}",
+                flush=True,
+            )
 
-    # Store optimal parameters for warm-start
+        final_param_binding = _build_param_dict(optimal_params)
+        if final_param_binding is None:
+            raise ValueError(
+                "Failed to bind VQE optimal parameters to ansatz; "
+                f"expected {num_parameters} values, "
+                f"got {len(np.asarray(optimal_params).reshape(-1)) if optimal_params is not None else 0}."
+            )
+        bound_circuit = ansatz.assign_parameters(final_param_binding)
+        statevector = Statevector(bound_circuit)
+
+        if vqe_args.verbose >= 2:
+            print(f"  Computing RDMs from statevector...")
+
+        rdm_time_start = perf_counter()
+        rdm1_local, rdm2_local = compute_rdms_from_statevector(statevector, norb, nelec)
+        rdm_time_end = perf_counter()
+
+        run_timings = {
+            "pre_optimization": pre_opt,
+            "optimizer": optimizer_time,
+            "statevector_and_rdms": rdm_time_end - rdm_time_start,
+        }
+
+        return {
+            "energy": float(optimal_energy),
+            "raw_energy": float(result.eigenvalue.real),
+            "params": optimal_params,
+            "rdm1": rdm1_local,
+            "rdm2": rdm2_local,
+            "records": records,
+            "iterations": int(result.cost_function_evals),
+            "timings": run_timings,
+        }
+
+    candidate_points: list[tuple[str, np.ndarray]] = []
+    stored_params = _vqe_state.fragment_params.get(frag_name)
+    if vqe_args.warm_start and stored_params is not None:
+        candidate_points.append(("warm", np.asarray(stored_params, dtype=float)))
+
+    zero_point = np.zeros(num_parameters)
+    if not candidate_points or not np.allclose(candidate_points[0][1], zero_point):
+        candidate_points.append(("hf", zero_point))
+
+    while len(candidate_points) < max(1, vqe_args.max_restarts):
+        candidate_points.append(
+            (
+                f"random_{len(candidate_points)}",
+                rng.uniform(-np.pi, np.pi, size=num_parameters),
+            )
+        )
+
+    best_run: dict[str, Any] | None = None
+    best_energy = float("inf")
+
+    for idx, (label, init_point) in enumerate(candidate_points[: max(1, vqe_args.max_restarts)]):
+        run_data = execute_vqe(init_point, idx, label)
+        energy = run_data["energy"]
+        if energy < best_energy:
+            best_energy = energy
+            best_run = run_data
+
+        if idx > 0 and abs(best_energy - energy) < vqe_args.restart_energy_tol:
+            if vqe_args.verbose >= 1:
+                print(
+                    f"  Restart improvement below {vqe_args.restart_energy_tol:.1e}; stopping restarts.",
+                    flush=True,
+                )
+            break
+
+    if best_run is None:
+        raise RuntimeError("VQE failed to produce a valid result")
+
+    optimal_energy = float(best_run["energy"])
+    optimal_params = np.asarray(best_run["params"], dtype=float)
+    rdm1 = best_run["rdm1"]
+    rdm2 = best_run["rdm2"]
+    callback_records = best_run["records"]
+
+    timings = best_run["timings"]
+    phase_timings["pre_optimization"] = timings["pre_optimization"]
+    phase_timings["optimizer"] = timings["optimizer"]
+    phase_timings["statevector_and_rdms"] = timings["statevector_and_rdms"]
+    phase_timings["total"] = (
+        phase_timings.get("load_hamiltonian", 0.0)
+        + phase_timings.get("build_ansatz", 0.0)
+        + phase_timings.get("initial_parameters", 0.0)
+        + phase_timings.get("backend_setup", 0.0)
+        + timings["pre_optimization"]
+        + timings["optimizer"]
+        + timings["statevector_and_rdms"]
+    )
+    phase_timings["optimizer_iterations"] = best_run["iterations"]
+
     if vqe_args.warm_start:
         _vqe_state.fragment_params[frag_name] = optimal_params
-
-    # Compute statevector from optimal parameters
-    bound_circuit = ansatz.assign_parameters(optimal_params)
-    statevector = Statevector(bound_circuit)
-
-    # Compute RDMs from statevector
-    if vqe_args.verbose >= 2:
-        print(f"  Computing RDMs from statevector...")
-
-    rdm1, rdm2 = compute_rdms_from_statevector(statevector, norb, nelec)
 
     if vqe_args.verbose >= 2:
         print(f"  RDM1 trace: {np.trace(rdm1):.6f} (expected: {nelec})")
         print(f"  RDM2 computed successfully")
 
+    # Ensure final record reflects the converged solution
+    if callback_needed:
+        needs_final_record = True
+        if callback_records:
+            last_energy = callback_records[-1].get("energy")
+            if last_energy is not None and np.isclose(last_energy, optimal_energy, atol=1e-12):
+                needs_final_record = False
+                callback_records[-1]["timings"] = phase_timings.copy()
+        if needs_final_record:
+            final_record: dict[str, Any] = {
+                "eval_count": best_run["iterations"],
+                "energy": optimal_energy,
+                "raw_energy": float(best_run["raw_energy"]),
+                "delta_energy": (
+                    optimal_energy - callback_records[-1]["energy"]
+                    if callback_records
+                    else None
+                ),
+                "timings": phase_timings.copy(),
+                "elapsed_time": phase_timings.get("total"),
+                "delta_time": None,
+            }
+            if vqe_args.track_density_matrices:
+                final_record["rdm1_trace"] = float(np.trace(rdm1))
+                prev_matrix = None
+                if callback_records:
+                    prev_matrix = callback_records[-1].get("rdm1_matrix")
+                if prev_matrix is not None:
+                    final_record["rdm1_delta"] = float(np.linalg.norm(rdm1 - prev_matrix))
+                else:
+                    final_record["rdm1_delta"] = None
+                final_record["density_time"] = phase_timings.get("statevector_and_rdms")
+            else:
+                final_record["rdm1_delta"] = None
+                final_record["density_time"] = phase_timings.get("statevector_and_rdms")
+            final_record["rdm1_matrix"] = rdm1
+            callback_records.append(final_record)
+
+    _vqe_state.fragment_timings[frag_name] = phase_timings.copy()
+
+    # Cache diagnostics for downstream inspection
+    if vqe_args.track_iteration_history:
+        _vqe_state.fragment_iteration_history[frag_name] = [
+            {
+                key: (
+                    value.copy()
+                    if isinstance(value, np.ndarray)
+                    else value.copy()
+                    if isinstance(value, dict)
+                    else value
+                )
+                for key, value in record.items()
+            }
+            for record in callback_records
+        ]
+    elif frag_name in _vqe_state.fragment_iteration_history:
+        # Drop stale history if tracking disabled for this run
+        _vqe_state.fragment_iteration_history.pop(frag_name, None)
+
+    _vqe_state.fragment_energies[frag_name] = optimal_energy
+    _vqe_state.fragment_rdm1[frag_name] = rdm1
+    _vqe_state.fragment_rdm2[frag_name] = rdm2
+
     return rdm1, rdm2
+
+
+def get_vqe_iteration_history(frag_name: str | None = None) -> dict[str, list[dict[str, Any]]]:
+    """
+    Retrieve stored VQE iteration history.
+
+    Parameters
+    ----------
+    frag_name : str | None
+        Specific fragment name. If None, return history for all fragments.
+
+    Returns
+    -------
+    dict
+        Mapping of fragment name to list of iteration records.
+    """
+    if frag_name is not None:
+        history = _vqe_state.fragment_iteration_history.get(frag_name, [])
+        return {frag_name: deepcopy(history)}
+
+    return {key: deepcopy(val) for key, val in _vqe_state.fragment_iteration_history.items()}
+
+
+def get_vqe_fragment_observables(frag_name: str | None = None) -> dict[str, dict[str, Any]]:
+    """
+    Retrieve converged VQE observables for fragments.
+
+    Parameters
+    ----------
+    frag_name : str | None
+        Specific fragment name. If None, return data for all fragments.
+
+    Returns
+    -------
+    dict
+        Mapping of fragment name to observables (energy, RDM1, RDM2).
+    """
+    def _build_payload(name: str) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if name in _vqe_state.fragment_energies:
+            payload["energy"] = _vqe_state.fragment_energies[name]
+        if name in _vqe_state.fragment_rdm1:
+            payload["rdm1"] = _vqe_state.fragment_rdm1[name].copy()
+        if name in _vqe_state.fragment_rdm2:
+            payload["rdm2"] = _vqe_state.fragment_rdm2[name].copy()
+        if name in _vqe_state.fragment_timings:
+            payload["timings"] = _vqe_state.fragment_timings[name].copy()
+        return payload
+
+    if frag_name is not None:
+        return {frag_name: _build_payload(frag_name)}
+
+    return {name: _build_payload(name) for name in _vqe_state.fragment_energies}
