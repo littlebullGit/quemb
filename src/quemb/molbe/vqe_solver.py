@@ -474,11 +474,16 @@ def regenerate_fcidump_with_heff(
     output_dir: str | Path,
 ) -> Path:
     """
-    Regenerate FCIDUMP file with current effective Hamiltonian.
+    Regenerate FCIDUMP file with current effective Hamiltonian in fragment MO basis.
 
-    This function creates a new FCIDUMP file that uses the CURRENT
-    one-electron Hamiltonian from the most recent SCF calculation.
-    This is essential for VQE to see BE optimization updates.
+    CRITICAL: VQE requires orthonormal orbitals for Jordan-Wigner mapping.
+    The embedding AO basis is NOT orthonormal (AO overlap matrix has off-diagonal
+    elements), so we MUST transform to fragment MO basis before creating FCIDUMP.
+
+    This function:
+    1. Loads current effective Hamiltonian from fragment (in AO basis)
+    2. Transforms h1e and h2e from embedding AO basis to fragment MO basis
+    3. Writes FCIDUMP in orthonormal MO basis for VQE
 
     Parameters
     ----------
@@ -494,63 +499,67 @@ def regenerate_fcidump_with_heff(
 
     Notes
     -----
-    The Hamiltonian is extracted from frag._effective_h1e, which is
-    explicitly stored in pfrag.py:285 when SCF is called.
+    The Hamiltonian is extracted from frag._effective_h1e (embedding AO basis),
+    which is stored in pfrag.py:285 when SCF is called.
 
-    This equals frag.fock + frag.heff at the time SCF was called,
-    ensuring VQE uses EXACTLY the same Hamiltonian that was passed
-    to get_scfObj() on pfrag.py:287.
+    The transformation to MO basis uses frag.mo_coeffs:
+    - h1e_mo = C^T @ h1e_ao @ C
+    - h2e_mo = C^T @ C^T @ C^T @ C^T @ h2e_ao (4-index transformation)
 
-    Why use explicit storage instead of computing frag.fock + frag.heff?
-    - frag.fock is STATIC (set once at initialization, never updated)
-    - frag._effective_h1e is CURRENT (stored when SCF runs with updated heff)
-    - This ensures VQE sees chemical potential updates across BE iterations
-
-    This addresses the bug where VQE was reading static FCIDUMP files
-    that never received updates during BE optimization.
+    This ensures VQE:
+    1. Uses orthonormal orbitals (required for Jordan-Wigner)
+    2. Sees chemical potential updates across BE iterations
+    3. Works in same basis as traditional solvers expect for RDM output
     """
-    # Load 2-electron integrals from HDF5 file
+    # Load 2-electron integrals from HDF5 file (in embedding AO basis)
     with h5py.File(frag.eri_file, "r") as f:
         eri = f[frag.dname][()]
-    eri = ao2mo.restore(1, eri, frag.nao)
+    eri_ao = ao2mo.restore(1, eri, frag.nao)
 
-    # Get CURRENT effective one-electron Hamiltonian that was used in SCF
-    # This is stored explicitly in pfrag.py:285 when SCF is called
-    # It equals: frag.fock + frag.heff (at the time SCF was called)
-    # This ensures VQE uses EXACTLY the same Hamiltonian as traditional solvers
+    # Get CURRENT effective one-electron Hamiltonian (in embedding AO basis)
     assert hasattr(frag, '_effective_h1e'), "SCF must be run before regenerating FCIDUMP"
-    h1e = frag._effective_h1e
+    h1e_ao = frag._effective_h1e
 
-    # 2-electron integrals remain unchanged
-    h2e = eri
+    # Get MO coefficients (transform from embedding AO to fragment MO)
+    assert frag.mo_coeffs is not None, "MO coefficients not available"
+    C = frag.mo_coeffs
+
+    # Transform h1e from AO to MO basis: h1e_mo = C^T @ h1e_ao @ C
+    h1e_mo = np.einsum('ip,ij,jq->pq', C, h1e_ao, C, optimize=True)
+
+    # Transform h2e from AO to MO basis: h2e_mo[pqrs] = C_ip C_jq C_kr C_ls h2e_ao[ijkl]
+    h2e_mo = np.einsum('ip,jq,kr,ls,ijkl->pqrs', C, C, C, C, eri_ao, optimize=True)
+
+    # Use transformed integrals
+    h1e = h1e_mo
+    h2e = h2e_mo
 
     # Write to FCIDUMP file with unique name to avoid race conditions
     output_path = Path(output_dir)
     output_file = output_path / f"h10_{frag.dname}_current"
 
     # DEBUG: Print what we're about to write to FCIDUMP
-    import numpy as np
     print(f"\n{'='*80}")
-    print(f"DEBUG vqe_solver.py:526 - About to write FCIDUMP")
+    print(f"DEBUG vqe_solver.py - Writing FCIDUMP in fragment MO basis")
     print(f"{'='*80}")
-    print(f"h1e.shape: {h1e.shape}")
-    print(f"h1e diagonal: {np.diag(h1e)}")
-    print(f"h2e.shape: {h2e.shape}")
-    print(f"frag.TA.shape: {frag.TA.shape}")
-    print(f"frag.TA.shape[1] (norb): {frag.TA.shape[1]}")
-    print(f"frag.nsocc (spatial orbitals): {frag.nsocc}")
-    print(f"2 * frag.nsocc (total electrons): {2 * frag.nsocc}")
-    print(f"frag.nao: {frag.nao}")
-    print(f"h1e matrix:\n{h1e}")
+    print(f"Basis: Fragment MO (orthonormal orbitals)")
+    print(f"h1e_mo.shape: {h1e.shape}")
+    print(f"h1e_mo diagonal: {np.diag(h1e)}")
+    print(f"h2e_mo.shape: {h2e.shape}")
+    print(f"norb (MO basis): {C.shape[1]}")
+    print(f"nelec: {2 * frag.nsocc}")
+    print(f"h1e_mo matrix:\n{h1e}")
     print(f"{'='*80}\n")
 
+    # Write FCIDUMP in fragment MO basis (orthonormal)
+    norb_mo = C.shape[1]
     fcidump.from_integrals(
         str(output_file),
         h1e,
         h2e,
-        frag.TA.shape[1],  # Number of orbitals
-        2 * frag.nsocc,    # Number of electrons (total electrons: 2 * spatial orbitals)
-        ms=0,              # Total spin
+        norb_mo,          # Number of MO orbitals
+        2 * frag.nsocc,   # Number of electrons
+        ms=0,             # Total spin
     )
 
     return output_file

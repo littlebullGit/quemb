@@ -511,25 +511,33 @@ def be_func(
 
         # Store MO-basis RDM for energy calculations
         if solver == "VQE":
-            # VQE already produces correctly normalized RDMs (trace = total electrons)
-            # No scaling needed - VQE implementation is already correct
+            # VQE produces RDMs in fragment MO basis (from FCIDUMP transformed to MO)
+            # This is the same basis that traditional solvers use
             vqe_trace = trace(rdm1_tmp)
             fobj.rdm1__ = rdm1_tmp.copy()
             print(f"DEBUG: VQE RDM trace: {vqe_trace:.6f} (expected: {2 * fobj.nsocc}, no scaling applied)")
         else:
-            # FCI and other solvers already have correct normalization
+            # FCI and other solvers already produce RDMs in MO basis
             fobj.rdm1__ = rdm1_tmp.copy()
 
         # Transform RDM to AO basis for density matching
-        # NOTE: VQE is special - it computes RDMs in the FCIDUMP basis
-        # When FCIDUMP uses basis='embedding', RDMs are already in embedding AO basis
-        # and should NOT be transformed. Only traditional solvers (FCI, CCSD, etc.)
-        # compute RDMs in MO basis that need C*rdm*C^T transformation.
+        # FIXED: VQE now generates FCIDUMP in fragment MO basis (orthonormal)
+        # and returns RDMs in the same MO basis as traditional solvers.
+        # All solvers need the same C*rdm*C^T transformation to AO basis.
         assert fobj.mo_coeffs is not None
         if solver == "VQE":
-            # VQE RDMs are computed in embedding AO basis (from FCIDUMP)
-            # Use the same RDM as MO-basis (no transformation needed)
-            fobj._rdm1 = rdm1_tmp.copy()
+            # VQE RDMs are now in fragment MO basis (same as traditional solvers)
+            # Transform to AO basis with same formula as other solvers
+            fobj._rdm1 = (
+                multi_dot(
+                    (
+                        fobj.mo_coeffs,
+                        rdm1_tmp,
+                        fobj.mo_coeffs.T,
+                    ),
+                )
+                * 0.5
+            )
         else:
             # Traditional solvers: RDMs in MO basis, transform to AO basis
             fobj._rdm1 = (
