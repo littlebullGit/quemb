@@ -474,16 +474,25 @@ def regenerate_fcidump_with_heff(
     output_dir: str | Path,
 ) -> Path:
     """
-    Regenerate FCIDUMP file with current effective Hamiltonian in fragment MO basis.
+    Regenerate FCIDUMP file with current effective Hamiltonian in canonical MO basis.
 
     CRITICAL: VQE requires orthonormal orbitals for Jordan-Wigner mapping.
     The embedding AO basis is NOT orthonormal (AO overlap matrix has off-diagonal
     elements), so we MUST transform to fragment MO basis before creating FCIDUMP.
 
+    CRITICAL: Orbitals must be sorted by effective Hamiltonian eigenvalues.
+    SCF produces MO coefficients ordered by Fock matrix eigenvalues. But after
+    adding chemical potential (heff), the effective Hamiltonian has different
+    orbital energy ordering. VQE's HartreeFock initial state assumes orbitals
+    are sorted by energy, so we must re-canonicalize to prevent converging to
+    excited states.
+
     This function:
     1. Loads current effective Hamiltonian from fragment (in AO basis)
     2. Transforms h1e and h2e from embedding AO basis to fragment MO basis
-    3. Writes FCIDUMP in orthonormal MO basis for VQE
+    3. Diagonalizes h1e_mo and re-orders orbitals by eigenvalues (canonical form)
+    4. Rotates h2e to match canonical orbital ordering
+    5. Writes FCIDUMP with canonically ordered orbitals for VQE
 
     Parameters
     ----------
@@ -502,14 +511,20 @@ def regenerate_fcidump_with_heff(
     The Hamiltonian is extracted from frag._effective_h1e (embedding AO basis),
     which is stored in pfrag.py:285 when SCF is called.
 
-    The transformation to MO basis uses frag.mo_coeffs:
-    - h1e_mo = C^T @ h1e_ao @ C
-    - h2e_mo = C^T @ C^T @ C^T @ C^T @ h2e_ao (4-index transformation)
+    The transformation to canonical MO basis:
+    1. h1e_mo = C^T @ h1e_ao @ C
+    2. h2e_mo = C_ip C_jq C_kr C_ls h2e_ao[ijkl]
+    3. Diagonalize h1e_mo: E, U = eigh(h1e_mo)
+    4. Sort by eigenvalues: idx = argsort(E)
+    5. h1e_canonical = diag(E[idx])
+    6. h2e_canonical = U_ip U_jq U_kr U_ls h2e_mo[ijkl]
+    7. Update mo_coeffs: C_new = C @ U[:, idx]
 
     This ensures VQE:
     1. Uses orthonormal orbitals (required for Jordan-Wigner)
-    2. Sees chemical potential updates across BE iterations
-    3. Works in same basis as traditional solvers expect for RDM output
+    2. HF initial state fills truly lowest-energy orbitals (prevents excited states)
+    3. Sees chemical potential updates across BE iterations
+    4. Returns RDMs in correct basis for energy assembly
     """
     # Load 2-electron integrals from HDF5 file (in embedding AO basis)
     with h5py.File(frag.eri_file, "r") as f:
@@ -530,9 +545,39 @@ def regenerate_fcidump_with_heff(
     # Transform h2e from AO to MO basis: h2e_mo[pqrs] = C_ip C_jq C_kr C_ls h2e_ao[ijkl]
     h2e_mo = np.einsum('ip,jq,kr,ls,ijkl->pqrs', C, C, C, C, eri_ao, optimize=True)
 
-    # Use transformed integrals
-    h1e = h1e_mo
-    h2e = h2e_mo
+    # CRITICAL FIX: Re-order orbitals by effective Hamiltonian eigenvalues
+    # The MO coefficients from SCF are ordered by Fock matrix eigenvalues.
+    # But after adding chemical potential (heff), the effective Hamiltonian
+    # h1e_mo has different orbital energy ordering. If we don't reorder,
+    # VQE's HartreeFock initial state will fill the wrong orbitals and
+    # converge to an excited state instead of ground state.
+    #
+    # Solution: Diagonalize h1e_mo and reorder orbitals by eigenvalues.
+    # This ensures HF initial state fills truly lowest-energy orbitals.
+
+    # Diagonalize h1e_mo to get eigenvalues and eigenvectors
+    mo_energies, mo_rotation = np.linalg.eigh(h1e_mo)
+
+    # Sort by energy (ascending order)
+    idx_sorted = np.argsort(mo_energies)
+    mo_energies_sorted = mo_energies[idx_sorted]
+    mo_rotation_sorted = mo_rotation[:, idx_sorted]
+
+    # Rotate h1e to canonical (diagonal) form with sorted energies
+    h1e_canonical = np.diag(mo_energies_sorted)
+
+    # Rotate h2e to match the new orbital ordering
+    # h2e_canonical[pqrs] = U_ip U_jq U_kr U_ls h2e_mo[ijkl]
+    U = mo_rotation_sorted
+    h2e_canonical = np.einsum('ip,jq,kr,ls,ijkl->pqrs', U, U, U, U, h2e_mo, optimize=True)
+
+    # Use canonically ordered integrals
+    h1e = h1e_canonical
+    h2e = h2e_canonical
+
+    # Update stored MO coefficients to reflect canonical ordering
+    # This ensures RDMs returned by VQE are in the correct basis
+    frag.mo_coeffs = C @ mo_rotation_sorted
 
     # Write to FCIDUMP file with unique name to avoid race conditions
     output_path = Path(output_dir)
@@ -540,19 +585,20 @@ def regenerate_fcidump_with_heff(
 
     # DEBUG: Print what we're about to write to FCIDUMP
     print(f"\n{'='*80}")
-    print(f"DEBUG vqe_solver.py - Writing FCIDUMP in fragment MO basis")
+    print(f"DEBUG vqe_solver.py - Writing FCIDUMP in canonical MO basis")
     print(f"{'='*80}")
-    print(f"Basis: Fragment MO (orthonormal orbitals)")
-    print(f"h1e_mo.shape: {h1e.shape}")
-    print(f"h1e_mo diagonal: {np.diag(h1e)}")
-    print(f"h2e_mo.shape: {h2e.shape}")
-    print(f"norb (MO basis): {C.shape[1]}")
+    print(f"Basis: Canonical fragment MO (orbitals sorted by energy)")
+    print(f"h1e_canonical.shape: {h1e.shape}")
+    print(f"MO energies (sorted): {mo_energies_sorted}")
+    print(f"h1e_canonical diagonal: {np.diag(h1e)}")
+    print(f"h2e_canonical.shape: {h2e.shape}")
+    print(f"norb (MO basis): {frag.mo_coeffs.shape[1]}")
     print(f"nelec: {2 * frag.nsocc}")
-    print(f"h1e_mo matrix:\n{h1e}")
+    print(f"Orbitals 0-{frag.nsocc-1} will be occupied in HF initial state")
     print(f"{'='*80}\n")
 
-    # Write FCIDUMP in fragment MO basis (orthonormal)
-    norb_mo = C.shape[1]
+    # Write FCIDUMP in canonical MO basis (orbitals sorted by energy)
+    norb_mo = frag.mo_coeffs.shape[1]
     fcidump.from_integrals(
         str(output_file),
         h1e,
