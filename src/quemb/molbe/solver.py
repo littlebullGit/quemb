@@ -575,75 +575,22 @@ def be_func(
             fobj.rdm2__ = rdm2s.copy()
             # Find the energy of a given fragment.
             # Return [e1, e2, ec] as e_f and add to the running total_e.
-            # DEBUG: Check Hamiltonian being used for energy assembly
-            if solver == "VQE":
-                print(f"\n=== DEBUG ENERGY ASSEMBLY FOR VQE ===")
-                print(f"Fragment {fobj.dname}:")
-                print(f"fobj.h1 (original core) diagonal: {diag(fobj.h1)}")
-                print(f"fobj.fock diagonal: {diag(fobj.fock)}")
-                print(f"fobj.heff diagonal: {diag(fobj.heff)}")
-                print(f"fobj._effective_h1e diagonal: {diag(fobj._effective_h1e)}")
-                print(f"Difference (fock - h1): {diag(fobj.fock - fobj.h1)}")
-                print(f"==========================================\n")
-                
-                # THEORY TEST: Try both original h1 and effective h1e
-                print(f"TESTING THEORY: Computing energy with original h1...")
-                e_f_original = get_frag_energy(
-                    mo_coeffs=fobj.mo_coeffs,
-                    nsocc=fobj.nsocc,
-                    n_frag=fobj.n_frag,
-                    weight_and_relAO_per_center=fobj.weight_and_relAO_per_center,
-                    TA=fobj.TA,
-                    h1=fobj.h1,  # Original core Hamiltonian
-                    rdm1=rdm1_tmp,
-                    rdm2s=rdm2s,
-                    dname=fobj.dname,
-                    veff0=fobj.veff0,
-                    veff=None if use_cumulant else fobj.veff,
-                    use_cumulant=use_cumulant,
-                    eri_file=fobj.eri_file,
-                )
-                
-                print(f"TESTING THEORY: Computing energy with effective h1e...")
-                e_f_effective = get_frag_energy(
-                    mo_coeffs=fobj.mo_coeffs,
-                    nsocc=fobj.nsocc,
-                    n_frag=fobj.n_frag,
-                    weight_and_relAO_per_center=fobj.weight_and_relAO_per_center,
-                    TA=fobj.TA,
-                    h1=fobj._effective_h1e,  # Effective Hamiltonian (includes heff)
-                    rdm1=rdm1_tmp,
-                    rdm2s=rdm2s,
-                    dname=fobj.dname,
-                    veff0=fobj.veff0,
-                    veff=None if use_cumulant else fobj.veff,
-                    use_cumulant=use_cumulant,
-                    eri_file=fobj.eri_file,
-                )
-                
-                print(f"Energy with original h1: {e_f_original}")
-                print(f"Energy with effective h1e: {e_f_effective}")
-                print(f"Difference: {[a - b for a, b in zip(e_f_effective, e_f_original)]}")
-                
-                # Use original h1 for VQE (REVERT: effective h1e made things worse)
-                e_f = e_f_original
-                print(f"USING ORIGINAL H1 FOR VQE ENERGY ASSEMBLY (effective h1e made total energy worse)")
-            else:
-                e_f = get_frag_energy(
-                    mo_coeffs=fobj.mo_coeffs,
-                    nsocc=fobj.nsocc,
-                    n_frag=fobj.n_frag,
-                    weight_and_relAO_per_center=fobj.weight_and_relAO_per_center,
-                    TA=fobj.TA,
-                    h1=fobj.h1,
-                    rdm1=rdm1_tmp,
-                    rdm2s=rdm2s,
-                    dname=fobj.dname,
-                    veff0=fobj.veff0,
-                    veff=None if use_cumulant else fobj.veff,
-                    use_cumulant=use_cumulant,
-                    eri_file=fobj.eri_file,
-                )
+            # All solvers use the same energy assembly with original h1
+            e_f = get_frag_energy(
+                mo_coeffs=fobj.mo_coeffs,
+                nsocc=fobj.nsocc,
+                n_frag=fobj.n_frag,
+                weight_and_relAO_per_center=fobj.weight_and_relAO_per_center,
+                TA=fobj.TA,
+                h1=fobj.h1,
+                rdm1=rdm1_tmp,
+                rdm2s=rdm2s,
+                dname=fobj.dname,
+                veff0=fobj.veff0,
+                veff=None if use_cumulant else fobj.veff,
+                use_cumulant=use_cumulant,
+                eri_file=fobj.eri_file,
+            )
             total_e = [sum(x) for x in zip(total_e, e_f)]
             fobj.update_ebe_hf()
     if eeval:
