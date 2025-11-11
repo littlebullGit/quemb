@@ -1,4 +1,4 @@
-# Author(s): Derek Wang (VQE implementation)
+# Author(s): Derek Peng (VQE implementation)
 """
 VQE (Variational Quantum Eigensolver) solver for Bootstrap Embedding.
 
@@ -575,9 +575,28 @@ def regenerate_fcidump_with_heff(
     h1e = h1e_canonical
     h2e = h2e_canonical
 
-    # Update stored MO coefficients to reflect canonical ordering
-    # This ensures RDMs returned by VQE are in the correct basis
-    frag.mo_coeffs = C @ mo_rotation_sorted
+    # CRITICAL FIX FOR BE ASSEMBLY:
+    # DO NOT update frag.mo_coeffs! The TA matrix was computed with the original
+    # mo_coeffs during fragment initialization. If we change mo_coeffs here, we
+    # create a basis mismatch during RDM assembly:
+    #   rdm_AO = TA @ Pc @ (mo_coeffs @ rdm_MO @ mo_coeffs.T) @ TA.T
+    # where TA expects original mo_coeffs but gets canonical mo_coeffs.
+    #
+    # Instead, we:
+    # 1. Keep frag.mo_coeffs = C (original, unchanged)
+    # 2. Store rotation matrix U for later RDM transformation
+    # 3. VQE computes RDMs in canonical basis
+    # 4. After VQE, transform RDMs back: rdm_original = U @ rdm_canonical @ U.T
+    # 5. BE assembly uses original mo_coeffs → correct transformation!
+    #
+    # This allows VQE to work in canonical basis (preventing excited states)
+    # while maintaining BE assembly consistency.
+
+    # Store rotation matrix for RDM basis transformation
+    frag.canonical_rotation = mo_rotation_sorted  # U matrix
+
+    # Keep original MO coefficients (DO NOT UPDATE)
+    # frag.mo_coeffs remains C (original from SCF)
 
     # Write to FCIDUMP file with unique name to avoid race conditions
     output_path = Path(output_dir)
@@ -595,6 +614,10 @@ def regenerate_fcidump_with_heff(
     print(f"norb (MO basis): {frag.mo_coeffs.shape[1]}")
     print(f"nelec: {2 * frag.nsocc}")
     print(f"Orbitals 0-{frag.nsocc-1} will be occupied in HF initial state")
+    print(f"")
+    print(f"NOTE: frag.mo_coeffs is NOT updated (kept as original basis)")
+    print(f"      VQE RDMs will be transformed back to original basis after solving")
+    print(f"      This maintains BE assembly consistency with TA matrix")
     print(f"{'='*80}\n")
 
     # Write FCIDUMP in canonical MO basis (orbitals sorted by energy)
@@ -1064,9 +1087,39 @@ def solve_vqe(
 
     optimal_energy = float(best_run["energy"])
     optimal_params = np.asarray(best_run["params"], dtype=float)
-    rdm1 = best_run["rdm1"]
-    rdm2 = best_run["rdm2"]
+    rdm1_canonical = best_run["rdm1"]
+    rdm2_canonical = best_run["rdm2"]
     callback_records = best_run["records"]
+
+    # CRITICAL: Transform RDMs back from canonical to original MO basis
+    # VQE computed RDMs in canonical basis (where h1e is diagonal).
+    # But BE assembly expects RDMs in the original MO basis (matching frag.mo_coeffs).
+    # The rotation matrix U transforms original → canonical: MO_canonical = U.T @ MO_original
+    # So to transform RDMs back: rdm_original = U @ rdm_canonical @ U.T
+    if hasattr(frag, 'canonical_rotation'):
+        U = frag.canonical_rotation  # Rotation matrix from regenerate_fcidump_with_heff
+
+        # Transform 1-RDM: rdm1_original[i,j] = U[k,i] rdm1_canonical[k,l] U[l,j]
+        rdm1 = U @ rdm1_canonical @ U.T
+
+        # Transform 2-RDM: rdm2_original[i,j,k,l] = U[p,i] U[q,j] U[r,k] U[s,l] rdm2_canonical[p,q,r,s]
+        rdm2 = np.einsum('pi,qj,rk,sl,pqrs->ijkl', U, U, U, U, rdm2_canonical, optimize=True)
+
+        if vqe_args.verbose >= 2:
+            print(f"\n{'='*80}")
+            print(f"DEBUG vqe_solver.py - Transformed RDMs back to original MO basis")
+            print(f"{'='*80}")
+            print(f"RDM1 trace (canonical): {np.trace(rdm1_canonical):.6f}")
+            print(f"RDM1 trace (original):  {np.trace(rdm1):.6f}")
+            print(f"Trace should be preserved: {nelec}")
+            print(f"Difference: {abs(np.trace(rdm1) - np.trace(rdm1_canonical)):.2e}")
+            print(f"{'='*80}\n")
+    else:
+        # No canonical rotation was applied (shouldn't happen, but handle gracefully)
+        rdm1 = rdm1_canonical
+        rdm2 = rdm2_canonical
+        if vqe_args.verbose >= 1:
+            print("WARNING: No canonical_rotation found on fragment. Using RDMs as-is.")
 
     timings = best_run["timings"]
     phase_timings["pre_optimization"] = timings["pre_optimization"]
